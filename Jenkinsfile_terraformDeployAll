@@ -1,0 +1,86 @@
+#!/usr/bin/env groovy
+
+properties([buildDiscarder(logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '10')), parameters([choice(choices: ['none', 'dev', 'stage', 'prod'], description: 'Deployment environment', name: 'Environment')])])
+if (params.Environment == "none") {
+  echo "Deploy environment not chosen"
+  return
+}
+
+//Notifications via AWS SNS
+def sendNotifications(String status){
+    withAWS(credentials: 'e4f6b44e-5a1f-465a-97a3-3f978e25099f', endpointUrl: 'sns.eu-west-1.amazonaws.com', region: 'eu-west-1') {
+        snsPublish(topicArn:'arn:aws:sns:eu-west-1:197109732649:jenkins-rsvp', subject:'Jenkins job status', message:"jenkins job '$JOB_NAME' with build id '$BUILD_ID' '${status}' on '$JENKINS_URL'", messageAttributes: ['k1': 'v1', 'k2': 'v2'])
+    }
+
+}
+
+def deploy_resource(list) {
+    list.each { item ->
+	    sh "echo ############################\nDeploying ${item}\n############################"
+
+		sh "sed -i '/region = \"\${var.aws_region}\"/a   shared_credentials_file = \"/home/jenkins/.aws/credentials\"' ./deploy-rsvp/terraform/\$Environment/aws/\${item}/provider.tf"
+
+		retry(3) {
+			sh 'cd ./deploy-rsvp/terraform/$Environment/aws/${item} && terraform init'
+		}
+		retry(3) {
+			sh 'cd ./deploy-rsvp/terraform/$Environment/aws/${item} && terraform workspace select $Environment'
+		}
+		retry(3) {
+			sh 'cd ./deploy-rsvp/terraform/$Environment/aws/${item} && terraform apply -var-file dev.tfvars -auto-approve'
+		}
+    }
+}
+
+resource_name = ['activemq', 'apache_oidc',  'gas', 'haproxy', 'het', 'jboss',  'weblogic']
+
+
+pipeline {
+    agent {
+        label 'docker-terraform'
+    }
+	environment {
+	    terraform_auth_key = credentials('aws_auth')
+
+	}
+
+    stages {
+        stage('pre-checkout') {
+            steps {
+
+                sendNotifications('STARTED')
+				sh 'mkdir -p /home/jenkins/.aws'
+				sh 'echo $terraform_auth_key | base64 -d > /home/jenkins/.aws/credentials'
+
+            }
+        }
+		stage('Checkout') {
+	        steps {
+			    checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'github-ssh-key', url: 'git@github.build.ge.com:503079688/dst-iaac.git']]])
+		 	}
+
+		}
+		stage('Deploy resource') {
+		    steps {
+
+			   deploy_resource(resource_name)
+
+			}
+
+
+		}
+
+    }
+
+	post {
+
+	   success {
+	      sendNotifications('SUCCEEDED')
+	   }
+
+	   failure {
+	      sendNotifications('FAILED')
+	   }
+
+	}
+}
